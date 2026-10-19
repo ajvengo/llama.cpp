@@ -1,4 +1,5 @@
 #include "ggml-metal-tuning.h"
+#include "ggml-metal-device.h"
 
 #include <cstddef>
 #include <cstring>
@@ -1167,6 +1168,69 @@ fa_vec_cfg_t fa_vec_pick(int gpu_family, int dtype, int dk, int dv, int64_t ne11
     k.ne01_b = (ne01_b == 0) ? FA_VEC_DOMAIN_DECODE : FA_VEC_DOMAIN_BATCH;
     if (auto * c = find_cfg(fa_vec_tuned_table, std::size(fa_vec_tuned_table), k)) {
         return *c;
+    }
+
+    return baseline;
+}
+
+int fa_ne11_bucket(int64_t ne11) {
+    for (int i = 0; i < (int) std::size(FA_NE11_BUCKETS); ++i) {
+        if (ne11 < FA_NE11_BUCKETS[i]) {
+            return i;
+        }
+    }
+    return (int) std::size(FA_NE11_BUCKETS);
+}
+
+// Large-launch setting validated on M4 Max.
+constexpr fa_entry_t fa_tuned_table[] = {
+    { { GGML_METAL_DEVICE_M4_MAX, 2, 128, 128 }, { 16, 8 }, 4096 },
+};
+
+static bool     g_fa_override_set = false;
+static fa_cfg_t g_fa_override_cfg = { FA_Q_BASELINE, 0 };
+
+void fa_set_override(fa_cfg_t cfg) {
+    g_fa_override_cfg = cfg;
+    g_fa_override_set = true;
+}
+
+void fa_clear_override() {
+    g_fa_override_set = false;
+}
+
+fa_cfg_t fa_pick(int device_id, int dk, int dv, int64_t ne11, int64_t ne01, int64_t ne02, int64_t ne03) {
+    if (g_fa_override_set) {
+        return g_fa_override_cfg;
+    }
+
+    const fa_cfg_t baseline = { FA_Q_BASELINE, 0 };
+
+    if (device_id == GGML_METAL_DEVICE_GENERIC || ne01 < FA_NE01_MIN) {
+        return baseline;
+    }
+
+    // a last tile of 1..8 rows is padded with 8 more rows than baseline, costing 1/ceil(ne01/8)
+    const int64_t ne01_last = ne01 % FA_Q_WIDE;
+    if (ne01_last >= 1 && ne01_last <= FA_Q_BASELINE &&
+        (ne01 + FA_Q_BASELINE - 1)/FA_Q_BASELINE < FA_NE01_MIN_PARTIAL_TILES) {
+        return baseline;
+    }
+
+    const int64_t tiles = ((ne01 + FA_Q_WIDE - 1)/FA_Q_WIDE)*ne02*ne03;
+
+    fa_key_t k{};
+    k.device_id = (int8_t) device_id;
+    k.dk        = (int16_t) dk;
+    k.dv        = (int16_t) dv;
+
+    for (const int8_t ne11_b : { (int8_t) fa_ne11_bucket(ne11), FA_NE11_DEFAULT }) {
+        k.ne11_b = ne11_b;
+        for (const auto & e : fa_tuned_table) {
+            if (memcmp(&e.key, &k, sizeof(k)) == 0) {
+                return tiles >= e.tiles_min ? e.cfg : baseline;
+            }
+        }
     }
 
     return baseline;
